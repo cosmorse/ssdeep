@@ -76,3 +76,60 @@ func TestLargeSimilarity(t *testing.T) {
 		t.Errorf("Expected high score for large similar data, got %d", score)
 	}
 }
+
+func BenchmarkHashBytes1K(b *testing.B) {
+	data := make([]byte, 1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = HashBytes(data)
+	}
+}
+
+func BenchmarkHashBytes64K(b *testing.B) {
+	data := make([]byte, 64*1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = HashBytes(data)
+	}
+}
+
+func BenchmarkHashBytes1M(b *testing.B) {
+	data := make([]byte, 1024*1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = HashBytes(data)
+	}
+}
+
+func BenchmarkCompare(b *testing.B) {
+	data1 := make([]byte, 10000)
+	for i := range data1 {
+		data1[i] = byte(i % 256)
+	}
+	data2 := make([]byte, 10000)
+	copy(data2, data1)
+	data2[5000] = data2[5000] ^ 0xFF
+
+	h1, _ := HashBytes(data1)
+	h2, _ := HashBytes(data2)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = Compare(h1, h2)
+	}
+}
