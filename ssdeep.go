@@ -188,7 +188,13 @@ func (state *ssdeepState) Sum() string {
 		r2 = append(r2, base64Chars[state.p2%64])
 	}
 
-	return fmt.Sprintf("%d:%s:%s", state.blockSize, string(r1), string(r2))
+	hash := make([]byte, 0, len(r1)+len(r2)+20)
+	hash = strconv.AppendInt(hash, int64(state.blockSize), 10)
+	hash = append(hash, ':')
+	hash = append(hash, r1...)
+	hash = append(hash, ':')
+	hash = append(hash, r2...)
+	return string(hash)
 }
 
 func (state *ssdeepState) Close() error {

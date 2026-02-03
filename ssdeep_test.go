@@ -1,7 +1,7 @@
 package ssdeep
 
 import (
-	"os"
+	"crypto/rand"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -121,6 +121,19 @@ func BenchmarkHashBytes1M(b *testing.B) {
 	}
 }
 
+func BenchmarkHashBytes10M(b *testing.B) {
+	data := make([]byte, 10*1024*1024)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = Bytes(data)
+	}
+}
+
 func BenchmarkCompare(b *testing.B) {
 	data1 := make([]byte, 10000)
 	for i := range data1 {
@@ -141,27 +154,14 @@ func BenchmarkCompare(b *testing.B) {
 }
 
 func TestHash(t *testing.T) {
-	data, err := os.ReadFile("/tmp/data")
+	data := make([]byte, 10<<20)
+	_, err := rand.Read(data)
 	require.NoError(t, err)
 	blockSize := estimateBlockSize(int64(len(data)))
 	state := newSSDeepState(blockSize)
 	_, err = state.Write(data)
 	require.NoError(t, err)
 	t.Log(state.Sum())
-}
-
-func BenchmarkHash(b *testing.B) {
-	data, err := os.ReadFile("/tmp/data")
-	require.NoError(b, err)
-	b.SetBytes(int64(len(data)))
-	b.ReportAllocs()
-	b.ResetTimer()
-	blockSize := estimateBlockSize(int64(len(data)))
-	for i := 0; i < b.N; i++ {
-		state := newSSDeepState(blockSize)
-		state.Write(data)
-		// state.Sum()
-	}
 }
 
 func TestMatchOfficialShortSample(t *testing.T) {
