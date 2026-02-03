@@ -168,19 +168,18 @@ func TestHash(t *testing.T) {
 func TestHashAgainstOfficialAlgorithm(t *testing.T) {
 	tests := []struct {
 		path         string
-		text         string
 		expectedHash string
 	}{
 		{
-			text:         "The quick brown fox jumps over the lazy dog",
-			expectedHash: "3:FJKKIUKacdn:FHIGM",
+			path:         "testdata/sample1.txt",
+			expectedHash: "3:FJKKIUKact:FHIGi",
 		},
 		{
-			text:         "A completely different string that should have no similarity",
-			expectedHash: "3:M3+4CDTfWRcyNEqrBFWMEWM8Xh:M3KDKKqzZEL8Xh",
+			path:         "testdata/sample2.txt",
+			expectedHash: "3:M3+4CDTfWRcyNEqrBFWMEWM8XJ:M3KDKKqzZEL8XJ",
 		},
 		{
-			path:         "testdata/sample",
+			path:         "testdata/sample.dat",
 			expectedHash: "196608:m3SuutoWSz3nONRfeuYzllWVa7KqNoweSDLft2SOQp1fy/x7ri:mbuQznoRfepzllWABp1fy/g",
 		},
 	}
@@ -192,15 +191,12 @@ func TestHashAgainstOfficialAlgorithm(t *testing.T) {
 			err  error
 		)
 
-		if tc.path != "" {
-			data, err = os.ReadFile(tc.path)
-			require.NoError(t, err, "Reading file failed for %s", tc.path)
-		} else {
-			data = []byte(tc.text)
-		}
+		data, err = os.ReadFile(tc.path)
+		require.NoError(t, err, "Reading file failed for %s", tc.path)
+
 		hash, err = Bytes(data)
-		require.NoError(t, err, "Hashing failed for %s", tc.text)
-		require.Equal(t, tc.expectedHash, hash, "Hash mismatch for %s", tc.text)
+		require.NoError(t, err, "Hashing failed for %s", tc.path)
+		require.Equal(t, tc.expectedHash, hash, "Hash mismatch for %s", tc.path)
 	}
 }
 
