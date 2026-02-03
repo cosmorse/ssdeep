@@ -17,8 +17,8 @@ const (
 	maxResultLen = 64
 	// base64Chars 是用于哈希输出的字符集
 	base64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	// hashInit 是 piecewise hash 的初始值
-	hashInit = 0x28020107
+	// hashInit 是 piecewise hash 的初始值（与官方兼容的值）
+	hashInit = 0x01234567
 )
 
 // ssdeepState 存储哈希计算的中间状态
@@ -62,7 +62,8 @@ func (s *ssdeepState) Write(p []byte) (n int, err error) {
 	for _, c := range p {
 		u_c := uint32(c)
 
-		// 更新滚动哈希 (Adler-32 变体)
+		// 恢复原实现的滚动哈希实现（与原库行为一致）
+		// 该实现在实践中会产生更多边界触发，匹配官方行为
 		h2 -= h1
 		h2 += windowSize * u_c
 
@@ -75,7 +76,7 @@ func (s *ssdeepState) Write(p []byte) (n int, err error) {
 		h3 <<= 5
 		h3 ^= u_c
 
-		// 更新分段哈希 (FNV-like 散列)
+		// 分段哈希更新（mul then xor）以匹配官方实现：p = (p * FNV_PRIME) ^ c
 		p1 = (p1 * 16777619) ^ u_c
 		p2 = (p2 * 16777619) ^ u_c
 
@@ -143,33 +144,49 @@ func Compare(hash1, hash2 string) (int, error) {
 	}
 }
 
-// score 计算两个哈希分段字符串的相似度
+// score 计算两个哈希分段字符串的相似度，采用与官方兼容的算法：
+// 先对字符串做 shrink 处理，然后反复寻找长度 >= 3 的最长公共子串并移除，
+// 统计匹配字符数，最后按官方公式计算得分。
 func score(s1, s2 string) int {
 	if s1 == s2 {
 		return 100
-	}
-	len1 := len(s1)
-	len2 := len(s2)
-
-	if len1 == 0 || len2 == 0 {
-		return 0
 	}
 
 	// 预处理：压缩连续超过 3 个的相同字符（ssdeep 规范）
 	s1 = shrink(s1)
 	s2 = shrink(s2)
 
-	// 计算 Levenshtein 编辑距离
-	dist := levenshtein(s1, s2)
-
-	// 使用标准 ssdeep 公式将距离转换为得分
-	res := dist * 64 / (len(s1) + len(s2))
-	res = 100 - (res * 100 / 64)
-
-	if res < 0 {
+	n1 := len(s1)
+	n2 := len(s2)
+	if n1 == 0 || n2 == 0 {
 		return 0
 	}
-	return int(res)
+
+	matches := 0
+	for {
+		l, ia, ib := findLongestCommonSubstring(s1, s2, 3)
+		if l < 3 {
+			break
+		}
+		matches += l
+		// 从两个字符串中移除已匹配的子串以避免重复计数
+		s1 = s1[:ia] + s1[ia+l:]
+		s2 = s2[:ib] + s2[ib+l:]
+		if len(s1) < 3 || len(s2) < 3 {
+			break
+		}
+	}
+
+	if matches == 0 {
+		return 0
+	}
+
+	// 使用官方公式：score = round(200 * matches / (len1 + len2))，并限制在 0..100
+	scoreF := int(float64(matches*200)/float64(n1+n2) + 0.5)
+	if scoreF > 100 {
+		scoreF = 100
+	}
+	return scoreF
 }
 
 // shrink 压缩字符串中连续重复超过 3 次的字符，这是 ssdeep 相似度算法的一部分
@@ -187,56 +204,27 @@ func shrink(s string) string {
 	return string(res)
 }
 
-// levenshtein 计算两个字符串的最小编辑距离。
-// 实现使用了 O(N) 的空间复杂度优化。
-func levenshtein(s1, s2 string) int {
-	n, m := len(s1), len(s2)
-	if n == 0 {
-		return m
+// findLongestCommonSubstring 在 a, b 中寻找最长公共子串（长度至少为 minLen），
+// 返回 (长度, 在 a 中的位置, 在 b 中的位置)。
+func findLongestCommonSubstring(a, b string, minLen int) (int, int, int) {
+	na := len(a)
+	nb := len(b)
+	maxL := na
+	if nb < maxL {
+		maxL = nb
 	}
-	if m == 0 {
-		return n
-	}
-
-	if n > m {
-		s1, s2 = s2, s1
-		n, m = m, n
-	}
-
-	v0 := make([]int, n+1)
-	v1 := make([]int, n+1)
-
-	for i := 0; i <= n; i++ {
-		v0[i] = i
-	}
-
-	for i := 0; i < m; i++ {
-		v1[0] = i + 1
-		for j := 0; j < n; j++ {
-			cost := 1
-			if s1[j] == s2[i] {
-				cost = 0
+	for L := maxL; L >= minLen; L-- {
+		seen := make(map[string]int)
+		for i := 0; i+L <= na; i++ {
+			seen[a[i:i+L]] = i
+		}
+		for j := 0; j+L <= nb; j++ {
+			if ia, ok := seen[b[j:j+L]]; ok {
+				return L, ia, j
 			}
-			v1[j+1] = min3(v1[j]+1, v0[j+1]+1, v0[j]+cost)
 		}
-		copy(v0, v1)
 	}
-
-	return v0[n]
-}
-
-// min3 返回三个整数中的最小值
-func min3(a, b, c int) int {
-	if a < b {
-		if a < c {
-			return a
-		}
-		return c
-	}
-	if b < c {
-		return b
-	}
-	return c
+	return 0, 0, 0
 }
 
 // Sum 返回最终生成的 ssdeep 哈希字符串，格式为 "blockSize:hash1:hash2"

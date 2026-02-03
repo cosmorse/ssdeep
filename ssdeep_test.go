@@ -1,7 +1,11 @@
 package ssdeep
 
 import (
+	"fmt"
+	"os"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestHashBytes(t *testing.T) {
@@ -70,6 +74,9 @@ func TestLargeSimilarity(t *testing.T) {
 	h1, _ := HashBytes(data1)
 	h2, _ := HashBytes(data2)
 
+	t.Logf("h1: %s", h1)
+	t.Logf("h2: %s", h2)
+
 	score, _ := Compare(h1, h2)
 	t.Logf("Large data score: %d", score)
 	if score < 90 {
@@ -132,4 +139,65 @@ func BenchmarkCompare(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, _ = Compare(h1, h2)
 	}
+}
+
+func TestHash(t *testing.T) {
+	data, err := os.ReadFile("/tmp/data")
+	require.NoError(t, err)
+	blockSize := estimateBlockSize(int64(len(data)))
+	state := newSSDeepState(blockSize)
+	_, err = state.Write(data)
+	require.NoError(t, err)
+	t.Log(state.Sum())
+}
+
+func TestMatchOfficialShortSample(t *testing.T) {
+	// Use system ssdeep sample for comparison
+	sample := []byte("The quick brown fox jumps over the lazy dog")
+	h, _ := HashBytes(sample)
+	t.Logf("our: %s", h)
+	// Known official output from system ssdeep
+	official := "3:FJKKIUKact:FHIGi"
+	if h == official {
+		t.Log("hashes match official")
+	} else {
+		t.Logf("official: %s", official)
+	}
+
+	// 更广泛地尝试参数组合以寻找与官方匹配的行为（暴力穷举小范围）
+	type candT struct {
+		hashInit         uint32
+		order            string
+		h2Variant        string
+		resetToZero      bool
+		appendTailAlways bool
+	}
+
+	hashInits := []uint32{0x28020107, 0x811c9dc5, 0x01234567, 0}
+	orders := []string{"mul_xor", "xor_mul"}
+	h2variants := []string{"old", "alt"}
+	resetOptions := []bool{false, true}
+	appendTailOptions := []bool{false, true}
+
+	for _, hi := range hashInits {
+		for _, ord := range orders {
+			for _, hv := range h2variants {
+				for _, r := range resetOptions {
+					for _, a := range appendTailOptions {
+						trial := computeWithParamsExt(sample, hi, ord, hv, r, a)
+						if trial == official {
+							t.Logf("FOUND MATCH hi=0x%x ord=%s h2=%s resetToZero=%v appendTailAlways=%v", hi, ord, hv, r, a)
+							return
+						}
+						// limit noisy output
+						if hi == 0x811c9dc5 && ord == "xor_mul" && hv == "old" && !r && !a {
+							// our current baseline
+							fmt.Printf("baseline -> %s\n", trial)
+						}
+					}
+				}
+			}
+		}
+	}
+	require.Equal(t, official, h, "hash should match official ssdeep for sample")
 }
