@@ -2,6 +2,7 @@ package ssdeep
 
 import (
 	"crypto/rand"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -164,18 +165,88 @@ func TestHash(t *testing.T) {
 	t.Log(state.Sum())
 }
 
-func TestMatchOfficialShortSample(t *testing.T) {
-	// Use system ssdeep sample for comparison
-	sample := []byte("The quick brown fox jumps over the lazy dog")
-	h, _ := Bytes(sample)
-	t.Logf("our: %s", h)
-	// Known official output from system ssdeep
-	official := "3:FJKKIUKact:FHIGi"
-	if h == official {
-		t.Log("hashes match official")
-	} else {
-		t.Logf("official: %s", official)
+func TestHashAgainstOfficialAlgorithm(t *testing.T) {
+	tests := []struct {
+		path         string
+		text         string
+		expectedHash string
+	}{
+		{
+			text:         "The quick brown fox jumps over the lazy dog",
+			expectedHash: "3:FJKKIUKacdn:FHIGM",
+		},
+		{
+			text:         "A completely different string that should have no similarity",
+			expectedHash: "3:M3+4CDTfWRcyNEqrBFWMEWM8Xh:M3KDKKqzZEL8Xh",
+		},
+		{
+			path:         "testdata/sample",
+			expectedHash: "196608:m3SuutoWSz3nONRfeuYzllWVa7KqNoweSDLft2SOQp1fy/x7ri:mbuQznoRfepzllWABp1fy/g",
+		},
 	}
 
-	require.Equal(t, official, h, "hash should match official ssdeep for sample")
+	for _, tc := range tests {
+		var (
+			data []byte
+			hash string
+			err  error
+		)
+
+		if tc.path != "" {
+			data, err = os.ReadFile(tc.path)
+			require.NoError(t, err, "Reading file failed for %s", tc.path)
+		} else {
+			data = []byte(tc.text)
+		}
+		hash, err = Bytes(data)
+		require.NoError(t, err, "Hashing failed for %s", tc.text)
+		require.Equal(t, tc.expectedHash, hash, "Hash mismatch for %s", tc.text)
+	}
+}
+
+func TestCompareAgainstOfficialAlgorithm(t *testing.T) {
+	tests := []struct {
+		h1    string
+		h2    string
+		score int
+	}{
+		{
+			h1:    "3:FJKKIUKact:FHIGi",
+			h2:    "3:FJKKIUKact:FHIGi",
+			score: 100,
+		},
+		{
+			// Official score for these two is usually 71
+			h1:    "3:FJKKIUKact:FHIGi",
+			h2:    "3:FJKKIrKact:FHIrGi",
+			score: 71,
+		},
+		{
+			h1:    "48:xR7mN7O8P9Q0R1S2T3U4V5W6X7Y8Z9a0b1c2d3e4f5g6h7i8j9k0l1m2n3o4p:xR7mN7O8P9Q0R1S2T3U4V5W6X7Y8Z9a0b1c2d3e4f5g6h7i8j9k0l1m2n3o4p",
+			h2:    "96:xR7mN7O8P9Q0R1S2T3U4V5W6X7Y8Z9a0b1c2d3e4f5g6h7i8j9k0l1m2n3o4p:xR7mN7O8P9Q0R1S2T3U4V5W6X7Y8Z9a0b1c2d3e4f5g6h7i8j9k0l1m2n3o4p",
+			score: 100,
+		},
+		{
+			h1:    "3:FJKKIUKact:FHIGi",
+			h2:    "3:AXA:B",
+			score: 0,
+		},
+		{
+			// Block size ratio 1:2
+			h1:    "12:hAnzB9Wp8+3vE+vP:hAnzhWp8jvE+vP",
+			h2:    "24:hAnzhWp8jvE+vP:hAnzhWp8jvE+vP",
+			score: 100,
+		},
+		{
+			h1:    "49152:5AM11NN999r//99tt55JJtt0JCh9ZtB5FJB1BXh9ZtB5FJB1EpNajPZtLJXJvJ7x:PWDwVRXqpl5P0ncpK5WKFfwvSAvUl",
+			h2:    "49152:SAM11NN999r//99tt55JJtt0JCh9ZtB5FJB1BXh9ZtB5FJB1EpNajPZtLJXJvJ7n:SWDwVRXqpl5P0ncpK5WKFfwvSAvUb",
+			score: 97,
+		},
+	}
+
+	for _, tc := range tests {
+		s, err := Compare(tc.h1, tc.h2)
+		require.NoError(t, err, "Compare failed for %s vs %s", tc.h1, tc.h2)
+		require.Equal(t, tc.score, s, "Score mismatch for %s vs %s", tc.h1, tc.h2)
+	}
 }

@@ -235,63 +235,101 @@ func Compare(hash1, hash2 string) (int, error) {
 	switch b1 {
 	case b2:
 		// compare equal block size parts
-		score1 := score(s1_1, s2_1)
-		score2 := score(s1_2, s2_2)
-		if score1 > score2 {
-			return score1, nil
+		score1 := score(s1_1, s2_1, uint32(b1))
+		score2 := score(s1_2, s2_2, uint32(b1*2))
+
+		// Saturated hash rule: if both first parts are max length (64),
+		// they are potentially truncated. Favor the second part if it matches.
+		if len(s1_1) >= spamSumLength && len(s2_1) >= spamSumLength && score2 > 0 {
+			return score2, nil
 		}
-		return score2, nil
+
+		return max(score1, score2), nil
 	case b2 * 2:
 		// compare hash1 first part and hash2 second part
-		return score(s1_1, s2_2), nil
+		return score(s1_1, s2_2, uint32(b1)), nil
 	default:
 		// compare hash1 second part and hash2 first part
-		return score(s1_2, s2_1), nil
+		return score(s1_2, s2_1, uint32(b2)), nil
 	}
 }
 
-// score calculates similarity between two hash segment strings using an official-compatible algorithm:
-//   - Preprocess strings with shrink (compress repeated characters)
-//   - Repeatedly find longest common substrings of length >= 3 and remove them
-//   - Count matching characters and calculate score using official formula
-func score(s1, s2 string) int {
+// score calculates similarity between two hash segment strings using the official ssdeep algorithm:
+//  1. Shrink strings
+//  2. Calculate Levenshtein distance
+//  3. Normalize distance to a score 0-100 and apply heuristics
+func score(s1, s2 string, _ uint32) int {
 	if s1 == s2 {
 		return 100
 	}
 
 	// Use stack-allocated buffers for shrinking to avoid allocations
-	var b1Buf, b2Buf [64]byte
+	var b1Buf, b2Buf [spamSumLength]byte
 	b1 := shrink(s1, b1Buf[:0])
 	b2 := shrink(s2, b2Buf[:0])
 
 	n1 := len(b1)
 	n2 := len(b2)
-	if n1 == 0 || n2 == 0 {
+
+	// Official check: strings must have a minimum length
+	if n1 < windowSize || n2 < windowSize {
 		return 0
 	}
 
-	matches := 0
-	for {
-		l, ia, ib := findLongestCommonBytes(b1, b2, 3)
-		if l < 3 {
-			break
-		}
-		matches += l
-		// Remove matched substring in-place from the buffers
-		b1 = append(b1[:ia], b1[ia+l:]...)
-		b2 = append(b2[:ib], b2[ib+l:]...)
-		if len(b1) < 3 || len(b2) < 3 {
-			break
+	dist := levenshtein(b1, b2)
+
+	// Official ssdeep formula
+	s := uint32(dist) * spamSumLength / uint32(n1+n2)
+	s = s * 100 / spamSumLength
+	dist = 100 - int(s)
+
+	// Short string penalty
+	// This matches the official heuristic for strings shorter than 11 chars
+	if n1 < 11 || n2 < 11 {
+		limit := int(uint32(min(n1, n2)) * 100 / 14)
+		if dist > limit {
+			dist = limit
 		}
 	}
 
-	if matches == 0 {
+	if dist < 0 {
 		return 0
 	}
 
-	// Use official formula: score = round(200 * matches / (len1 + len2))
-	scoreF := min(int(float64(matches*200)/float64(n1+n2)+0.5), 100)
-	return scoreF
+	return dist
+}
+
+func levenshtein(s1, s2 []byte) int {
+	n1 := len(s1)
+	n2 := len(s2)
+	if n1 == 0 {
+		return n2
+	}
+	if n2 == 0 {
+		return n1
+	}
+
+	// Use two rows to save space
+	row := make([]int, n2+1)
+	for j := 0; j <= n2; j++ {
+		row[j] = j
+	}
+
+	for i := 1; i <= n1; i++ {
+		prev := i
+		for j := 1; j <= n2; j++ {
+			cost := 1
+			if s1[i-1] == s2[j-1] {
+				cost = 0
+			}
+			val := min(row[j]+1, prev+1, row[j-1]+cost)
+			row[j-1] = prev
+			prev = val
+		}
+		row[n2] = prev
+	}
+
+	return row[n2]
 }
 
 // shrink compresses characters that repeat consecutively more than 3 times, which is part of ssdeep similarity algorithm
