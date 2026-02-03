@@ -387,10 +387,13 @@ func sumWithFixedSize(r io.Reader, fixedSize int64) (string, error) {
 	// Use the known size to set the correct block size
 	blockSize := estimateBlockSize(fixedSize)
 	state := newSSDeepState(blockSize)
+	defer state.Close()
+
 	_, err := io.Copy(state, r)
 	if err != nil {
 		return "", err
 	}
+
 	return state.Sum(), nil
 }
 
@@ -459,14 +462,15 @@ func Stream(r io.Reader, options ...Option) (string, error) {
 		return "", err
 	}
 
-	// Calculate block size based on actual size
-	blockSize := estimateBlockSize(sr.Size())
-	state := newSSDeepState(blockSize)
-
 	// Reset and read from cached data
 	if err := sr.Reset(); err != nil {
 		return "", err
 	}
+
+	// Calculate block size based on actual size
+	blockSize := estimateBlockSize(sr.Size())
+	state := newSSDeepState(blockSize)
+	defer state.Close()
 
 	// Hash the cached data
 	if _, err := io.Copy(state, sr); err != nil {
