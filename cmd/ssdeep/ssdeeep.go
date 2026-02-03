@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"gitee.com/cosmorse/ssdeep"
+	"github.com/cosmorse/ssdeep"
 	"github.com/spf13/cobra"
 )
 

@@ -1,4 +1,4 @@
-module gitee.com/cosmorse/ssdeep
+module github.com/cosmorse/ssdeep
 
 go 1.25.6
 
