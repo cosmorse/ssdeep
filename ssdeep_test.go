@@ -9,7 +9,7 @@ import (
 
 func TestHashBytes(t *testing.T) {
 	data := []byte("The quick brown fox jumps over the lazy dog")
-	hash, err := HashBytes(data)
+	hash, err := Bytes(data)
 	if err != nil {
 		t.Fatalf("HashBytes failed: %v", err)
 	}
@@ -24,9 +24,9 @@ func TestCompare(t *testing.T) {
 	s2 := "The quick brown fox jumps over the lazy dog!"
 	s3 := "A completely different string that should have no similarity"
 
-	h1, _ := HashBytes([]byte(s1))
-	h2, _ := HashBytes([]byte(s2))
-	h3, _ := HashBytes([]byte(s3))
+	h1, _ := Bytes([]byte(s1))
+	h2, _ := Bytes([]byte(s2))
+	h3, _ := Bytes([]byte(s3))
 
 	score12, err := Compare(h1, h2)
 	if err != nil {
@@ -53,8 +53,8 @@ func TestCompare(t *testing.T) {
 }
 
 func TestEmpty(t *testing.T) {
-	h1, _ := HashBytes([]byte(""))
-	h2, _ := HashBytes([]byte(""))
+	h1, _ := Bytes([]byte(""))
+	h2, _ := Bytes([]byte(""))
 	score, _ := Compare(h1, h2)
 	if score != 100 {
 		t.Errorf("Expected score 100 for empty strings, got %d", score)
@@ -70,8 +70,8 @@ func TestLargeSimilarity(t *testing.T) {
 	copy(data2, data1)
 	data2[5000] = data2[5000] ^ 0xFF // Change one byte
 
-	h1, _ := HashBytes(data1)
-	h2, _ := HashBytes(data2)
+	h1, _ := Bytes(data1)
+	h2, _ := Bytes(data2)
 
 	t.Logf("h1: %s", h1)
 	t.Logf("h2: %s", h2)
@@ -91,7 +91,7 @@ func BenchmarkHashBytes1K(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = HashBytes(data)
+		_, _ = Bytes(data)
 	}
 }
 
@@ -104,7 +104,7 @@ func BenchmarkHashBytes64K(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = HashBytes(data)
+		_, _ = Bytes(data)
 	}
 }
 
@@ -117,7 +117,7 @@ func BenchmarkHashBytes1M(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = HashBytes(data)
+		_, _ = Bytes(data)
 	}
 }
 
@@ -130,8 +130,8 @@ func BenchmarkCompare(b *testing.B) {
 	copy(data2, data1)
 	data2[5000] = data2[5000] ^ 0xFF
 
-	h1, _ := HashBytes(data1)
-	h2, _ := HashBytes(data2)
+	h1, _ := Bytes(data1)
+	h2, _ := Bytes(data2)
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -150,10 +150,24 @@ func TestHash(t *testing.T) {
 	t.Log(state.Sum())
 }
 
+func BenchmarkHash(b *testing.B) {
+	data, err := os.ReadFile("/tmp/data")
+	require.NoError(b, err)
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	blockSize := estimateBlockSize(int64(len(data)))
+	for i := 0; i < b.N; i++ {
+		state := newSSDeepState(blockSize)
+		state.Write(data)
+		// state.Sum()
+	}
+}
+
 func TestMatchOfficialShortSample(t *testing.T) {
 	// Use system ssdeep sample for comparison
 	sample := []byte("The quick brown fox jumps over the lazy dog")
-	h, _ := HashBytes(sample)
+	h, _ := Bytes(sample)
 	t.Logf("our: %s", h)
 	// Known official output from system ssdeep
 	official := "3:FJKKIUKact:FHIGi"

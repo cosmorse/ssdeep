@@ -1,57 +1,96 @@
-// package ssdeep 实现了 ssdeep (模糊哈希) 算法。
-// 该算法用于计算文件的相似度，即使文件内容有微小差异也能生成相似的哈希值。
+// Package ssdeep implements the ssdeep fuzzy hashing algorithm.
+// This algorithm computes fuzzy hashes for files, enabling similarity detection
+// even when files have minor differences.
 package ssdeep
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 )
 
 const (
-	// minBlockSize 是最小的分块大小
+	// minBlockSize is the smallest chunk size used in ssdeep algorithm (minimum 3)
 	minBlockSize = 3
-	// windowSize 是 rolling hash 使用的滑动窗口大小
+	// windowSize is the sliding window size used in rolling hash calculations (typically 7)
 	windowSize = 7
-	// maxResultLen 是生成哈希部分的最大长度（通常为 64 字符）
-	maxResultLen = 64
-	// base64Chars 是用于哈希输出的字符集
+	// spamSumLength is the maximum length of hash segments (typically 64 characters)
+	spamSumLength = 64
+	// base64Chars is the character set used for hash output encoding
 	base64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	// hashInit 是 piecewise hash 的初始值（与官方兼容的值）
+	// hashInit is the initial value for piecewise hash (compatible with official implementation)
 	hashInit = 0x01234567
 )
 
-// ssdeepState 存储哈希计算的中间状态
-type ssdeepState struct {
-	blockSize uint32 // 当前使用的分块大小
+var (
+	ErrEmptyData = fmt.Errorf("ssdeep: empty data")
+)
 
-	// Rolling hash 状态
-	h1, h2, h3 uint32           // 滚动哈希的三个组成部分
-	window     [windowSize]byte // 滑动窗口缓冲
-	n          uint32           // 已处理的字节计数，用于窗口索引
-
-	// Piecewise hash 状态
-	p1 uint32 // 用于 blockSize 的分段哈希值
-	p2 uint32 // 用于 blockSize * 2 的分段哈希值
-
-	// 结果缓冲
-	res1 []byte // 对应 blockSize 的哈希字符串
-	res2 []byte // 对应 blockSize * 2 的哈希字符串
+type hashOptions struct {
+	size int64
 }
 
-// newSSDeepState 初始化一个新的 ssdeepState
+type Option interface {
+	apply(*hashOptions)
+}
+
+type sizeOption int64
+
+func (o sizeOption) apply(h *hashOptions) {
+	if o > 0 {
+		h.size = int64(o)
+	}
+}
+
+func WithFixedSize(size int64) Option {
+	return sizeOption(size)
+}
+
+// ssdeepState stores the intermediate state for hash calculation
+// This structure maintains rolling hash (for detecting boundaries) and piecewise hash (for generating digest characters)
+// along with buffers for hash generation. Fields:
+//   - blockSize: basic chunk size for this hash (estimated from input length)
+//   - h1/h2/h3: three components of rolling hash (see Write for specific update rules)
+//   - window: stores recent windowSize bytes to maintain h1 sliding window
+//   - n: total processed bytes count (for window indexing)
+//   - p1/p2: current piecewise hash states for blockSize and blockSize*2 respectively
+//   - res1/res2: string digest results for two scales (mapped to base64Chars characters)
+type ssdeepState struct {
+	blockSize uint32 // Current chunk size used
+
+	// Rolling hash state
+	h1, h2, h3 uint32           // Three components of rolling hash
+	window     [windowSize]byte // Sliding window buffer
+	n          uint32           // Number of bytes processed, used for window index
+
+	// Piecewise hash state
+	p1 uint32 // Piecewise hash value for blockSize
+	p2 uint32 // Piecewise hash value for blockSize * 2
+
+	// Result buffer
+	res1 []byte // Hash string corresponding to blockSize
+	res2 []byte // Hash string corresponding to blockSize * 2
+}
+
+// newSSDeepState initializes a new ssdeepState
+// Initialization details:
+//   - p1/p2 initialized to hashInit (initial value for piecewise hash);
+//   - res1/res2 pre-allocated to avoid frequent expansion;
+//   - blockSize passed from upper layer to make output digest close to target length (see estimateBlockSize).
 func newSSDeepState(blockSize uint32) *ssdeepState {
 	return &ssdeepState{
 		blockSize: blockSize,
 		p1:        hashInit,
 		p2:        hashInit,
-		res1:      make([]byte, 0, maxResultLen+1),
-		res2:      make([]byte, 0, maxResultLen+1),
+		res1:      make([]byte, 0, spamSumLength+1),
+		res2:      make([]byte, 0, spamSumLength+1),
 	}
 }
 
-// Write 处理输入的字节流并更新哈希状态。
-// 它同时维护滚动哈希（用于确定分块边界）和分段哈希（用于计算块内容摘要）。
+// Write processes the input byte stream and updates the hash state.
+// It maintains both rolling hash (for determining chunk boundaries) and piecewise hash (for calculating block content digests).
 func (s *ssdeepState) Write(p []byte) (n int, err error) {
 	bs1 := s.blockSize
 	bs2 := bs1 * 2
@@ -62,8 +101,11 @@ func (s *ssdeepState) Write(p []byte) (n int, err error) {
 	for _, c := range p {
 		u_c := uint32(c)
 
-		// 恢复原实现的滚动哈希实现（与原库行为一致）
-		// 该实现在实践中会产生更多边界触发，匹配官方行为
+		// Rolling hash update (three components):
+		// 	- h1 represents sum of window bytes (maintained by adding new byte and removing oldest byte)
+		// 	- h2 accumulates h1 over time, providing temporal diffusion for boundary triggering
+		// 	- h3 introduces bit mixing through left shift and XOR with new byte for better randomness
+		// Specific update form comes from original implementation, proven in practice to closely match official behavior:
 		h2 -= h1
 		h2 += windowSize * u_c
 
@@ -76,23 +118,25 @@ func (s *ssdeepState) Write(p []byte) (n int, err error) {
 		h3 <<= 5
 		h3 ^= u_c
 
-		// 分段哈希更新（mul then xor）以匹配官方实现：p = (p * FNV_PRIME) ^ c
+		// Piecewise hash update (similar to FNV with multiply then XOR) to match official implementation: p = (p * FNV_PRIME) ^ c
+		// Uses p = (p * FNV_PRIME) ^ c, will map p to a 6-bit character when boundary is encountered
+		// to generate digest characters. The 16777619 is the common FNV prime.
 		p1 = (p1 * 16777619) ^ u_c
 		p2 = (p2 * 16777619) ^ u_c
 
 		h := h1 + h2 + h3
 
-		// 检查是否到达第一个分块边界 (blockSize)
+		// Check if first chunk boundary reached (blockSize)
 		if h%bs1 == (bs1 - 1) {
-			if len(s.res1) < maxResultLen {
+			if len(s.res1) < spamSumLength {
 				s.res1 = append(s.res1, base64Chars[p1%64])
 			}
-			p1 = hashInit // 重置分段哈希以便处理下一块
+			p1 = hashInit // Reset piecewise hash to process next chunk
 		}
 
-		// 检查是否到达第二个分块边界 (blockSize * 2)
+		// Check if second chunk boundary reached (blockSize * 2)
 		if h%bs2 == (bs2 - 1) {
-			if len(s.res2) < maxResultLen {
+			if len(s.res2) < spamSumLength {
 				s.res2 = append(s.res2, base64Chars[p2%64])
 			}
 			p2 = hashInit
@@ -107,8 +151,8 @@ func (s *ssdeepState) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-// Compare 计算两个 ssdeep 哈希值之间的相似度得分（0 到 100）。
-// 得分为 100 表示完全相同，0 表示没有显著相似性。
+// Compare calculates similarity score (0 to 100) between two ssdeep hash values.
+// Score of 100 means completely identical, 0 means no significant similarity.
 func Compare(hash1, hash2 string) (int, error) {
 	p1 := strings.Split(hash1, ":")
 	p2 := strings.Split(hash2, ":")
@@ -144,9 +188,10 @@ func Compare(hash1, hash2 string) (int, error) {
 	}
 }
 
-// score 计算两个哈希分段字符串的相似度，采用与官方兼容的算法：
-// 先对字符串做 shrink 处理，然后反复寻找长度 >= 3 的最长公共子串并移除，
-// 统计匹配字符数，最后按官方公式计算得分。
+// score calculates similarity between two hash segment strings using an official-compatible algorithm:
+//   - Preprocess strings with shrink (compress repeated characters)
+//   - Repeatedly find longest common substrings of length >= 3 and remove them
+//   - Count matching characters and calculate score using official formula
 func score(s1, s2 string) int {
 	if s1 == s2 {
 		return 100
@@ -189,14 +234,14 @@ func score(s1, s2 string) int {
 	return scoreF
 }
 
-// shrink 压缩字符串中连续重复超过 3 次的字符，这是 ssdeep 相似度算法的一部分
+// shrink compresses characters that repeat consecutively more than 3 times, which is part of ssdeep similarity algorithm
 func shrink(s string) string {
 	if len(s) <= 3 {
 		return s
 	}
 	res := make([]byte, 0, len(s))
 	for i := 0; i < len(s); i++ {
-		// 如果当前字符与前三个字符都相同，则跳过
+		// Skip if current character is the same as the previous three characters
 		if i < 3 || s[i] != s[i-1] || s[i] != s[i-2] || s[i] != s[i-3] {
 			res = append(res, s[i])
 		}
@@ -204,8 +249,9 @@ func shrink(s string) string {
 	return string(res)
 }
 
-// findLongestCommonSubstring 在 a, b 中寻找最长公共子串（长度至少为 minLen），
-// 返回 (长度, 在 a 中的位置, 在 b 中的位置)。
+// findLongestCommonSubstring finds the longest common substring in a, b with length at least minLen,
+// returns (length, position in a, position in b).
+// This function is used in the similarity calculation algorithm to find matching patterns between two hash strings.
 func findLongestCommonSubstring(a, b string, minLen int) (int, int, int) {
 	na := len(a)
 	nb := len(b)
@@ -227,66 +273,171 @@ func findLongestCommonSubstring(a, b string, minLen int) (int, int, int) {
 	return 0, 0, 0
 }
 
-// Sum 返回最终生成的 ssdeep 哈希字符串，格式为 "blockSize:hash1:hash2"
+// Sum returns the final generated ssdeep hash string in format "blockSize:hash1:hash2"
 func (s *ssdeepState) Sum() string {
-	// 即使没有到达边界，也要处理剩余的数据
+	// Process remaining data even if no boundary was reached
 	r1 := s.res1
-	if s.p1 != hashInit && len(r1) < maxResultLen {
+	if s.p1 != hashInit && len(r1) < spamSumLength {
 		r1 = append(r1, base64Chars[s.p1%64])
 	}
 	r2 := s.res2
-	if s.p2 != hashInit && len(r2) < maxResultLen {
+	if s.p2 != hashInit && len(r2) < spamSumLength {
 		r2 = append(r2, base64Chars[s.p2%64])
 	}
 
 	return fmt.Sprintf("%d:%s:%s", s.blockSize, string(r1), string(r2))
 }
 
-// HashBytes 计算给定字节数组的 ssdeep 模糊哈希值。
-func HashBytes(data []byte) (string, error) {
-	if len(data) == 0 {
-		return fmt.Sprintf("%d::", minBlockSize), nil
-	}
-	// 估算最合适的块大小
-	blockSize := estimateBlockSize(int64(len(data)))
-	s := newSSDeepState(blockSize)
-	_, _ = s.Write(data)
-	return s.Sum(), nil
-}
-
-// HashReader 从 io.Reader 计算 ssdeep 模糊哈希值。
-// 对于实现了 io.ReadSeeker 的对象（如文件），它会预先获取大小以优化内存。
-func HashReader(r io.Reader) (string, error) {
-	if rs, ok := r.(io.ReadSeeker); ok {
-		size, err := rs.Seek(0, io.SeekEnd)
-		if err != nil {
-			return "", err
-		}
-		_, err = rs.Seek(0, io.SeekStart)
-		if err != nil {
-			return "", err
-		}
-		blockSize := estimateBlockSize(size)
-		s := newSSDeepState(blockSize)
-		_, err = io.Copy(s, r)
-		if err != nil {
-			return "", err
-		}
-		return s.Sum(), nil
+// sumWithFixedSize processes data stream with a fixed size, using the correct block size
+func sumWithFixedSize(r io.Reader, fixedSize int64) (string, error) {
+	if fixedSize <= 0 {
+		return "", ErrEmptyData
 	}
 
-	// 对于普通的 Reader，需要读取全部内容以确定大小并估算块大小。
-	data, err := io.ReadAll(r)
+	// Use the known size to set the correct block size
+	blockSize := estimateBlockSize(fixedSize)
+	state := newSSDeepState(blockSize)
+	_, err := io.Copy(state, r)
 	if err != nil {
 		return "", err
 	}
-	return HashBytes(data)
+	return state.Sum(), nil
 }
 
-// estimateBlockSize 根据数据总大小估算初始块大小，旨在让生成的哈希长度接近 64 字符。
+// Bytes computes the ssdeep fuzzy hash for a given byte slice.
+func Bytes(data []byte) (string, error) {
+	if len(data) == 0 {
+		// Return a default empty hash representation instead of error
+		// Following the original ssdeep convention for empty data
+		blockSize := estimateBlockSize(0)
+		return fmt.Sprintf("%d::", blockSize), nil
+	}
+
+	return sumWithFixedSize(bytes.NewReader(data), int64(len(data)))
+}
+
+// File computes the ssdeep fuzzy hash for a file at the given path.
+func File(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	return Stream(file)
+}
+
+type statReader interface {
+	io.Reader
+	Stat() (os.FileInfo, error)
+}
+
+// Stream computes the ssdeep fuzzy hash from an io.Reader.
+// For objects implementing io.ReadSeeker (like files), it pre-fetches the size for optimal block size.
+// For regular Readers, it tries to determine the size when possible, or estimates block size from initial data.
+func Stream(r io.Reader, options ...Option) (string, error) {
+	var opts = hashOptions{size: -1}
+	for _, o := range options {
+		o.apply(&opts)
+	}
+
+	if opts.size <= 0 {
+		if ri, ok := r.(statReader); ok {
+			info, err := ri.Stat()
+			if err != nil {
+				return "", err
+			}
+
+			opts.size = info.Size()
+		} else if rs, ok := r.(io.ReadSeeker); ok {
+			size, err := rs.Seek(0, io.SeekEnd)
+			if err != nil {
+				return "", err
+			}
+
+			if _, err = rs.Seek(0, io.SeekStart); err != nil {
+				return "", err
+			}
+
+			opts.size = size
+		}
+	}
+
+	if opts.size >= 0 {
+		return sumWithFixedSize(r, opts.size)
+	}
+
+	// 对于普通Reader，我们需要估算合适的块大小
+	// 因为我们无法预先知道总大小（并且不能重置流）
+	//
+	// 解决方案：使用分块读取的方式，在读取过程中估算大小
+	const chunkSize = 64 * 1024 // 64KB chunks
+	buffer := make([]byte, chunkSize)
+
+	// 读取第一块数据来估算大小
+	n, err := r.Read(buffer)
+	if err == io.EOF {
+		// 数据很少，直接处理
+		blockSize := estimateBlockSize(int64(n))
+		state := newSSDeepState(blockSize)
+		_, writeErr := state.Write(buffer[:n])
+		if writeErr != nil {
+			return "", writeErr
+		}
+		return state.Sum(), nil
+	}
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+
+	// 基于已读取的数据估算总大小
+	// 如果第一块是满的，我们假设还有更多数据
+	var estimatedTotalSize int64
+	if n == chunkSize {
+		// 如果第一块是满的，假设实际大小是当前的2-4倍（启发式方法）
+		estimatedTotalSize = int64(n) * 4
+	} else {
+		// 如果第一块不满，这就是全部数据
+		estimatedTotalSize = int64(n)
+	}
+
+	// 使用估算的大小创建状态
+	blockSize := estimateBlockSize(estimatedTotalSize)
+	state := newSSDeepState(blockSize)
+
+	// 处理第一块数据
+	_, writeErr := state.Write(buffer[:n])
+	if writeErr != nil {
+		return "", writeErr
+	}
+
+	// 继续处理剩余数据
+	for {
+		n, err := r.Read(buffer)
+		if n > 0 {
+			_, writeErr := state.Write(buffer[:n])
+			if writeErr != nil {
+				return "", writeErr
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+
+	return state.Sum(), nil
+}
+
+// estimateBlockSize estimates the initial block size based on total data size, aiming to make the resulting hash length approach 64 characters.
+// This is crucial for ssdeep algorithm as the block size determines how frequently digest characters are generated.
+// The formula ensures that blockSize * spamSumLength (64) is approximately equal to or greater than the data size,
+// which helps generate hashes of reasonable length for similarity comparisons.
 func estimateBlockSize(size int64) uint32 {
 	blockSize := uint32(minBlockSize)
-	for uint64(blockSize)*maxResultLen < uint64(size) {
+	for uint64(blockSize)*spamSumLength < uint64(size) {
 		blockSize *= 2
 	}
 	return blockSize
