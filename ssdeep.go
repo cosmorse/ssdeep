@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 )
 
 const (
@@ -44,8 +46,18 @@ func (o sizeOption) apply(h *hashOptions) {
 	}
 }
 
+// WithFixedSize option allows specifying a fixed size for the hash.
 func WithFixedSize(size int64) Option {
 	return sizeOption(size)
+}
+
+var ssdeepStatePool = sync.Pool{
+	New: func() any {
+		return &ssdeepState{
+			hash1: make([]byte, 0, spamSumLength+1),
+			hash2: make([]byte, 0, spamSumLength+1),
+		}
+	},
 }
 
 // ssdeepState stores the intermediate state for hash calculation
@@ -69,34 +81,42 @@ type ssdeepState struct {
 	p1 uint32 // Piecewise hash value for blockSize
 	p2 uint32 // Piecewise hash value for blockSize * 2
 
-	// Result buffer
-	res1 []byte // Hash string corresponding to blockSize
-	res2 []byte // Hash string corresponding to blockSize * 2
+	// Result hash buffer
+	hash1 []byte // Hash string corresponding to blockSize
+	hash2 []byte // Hash string corresponding to blockSize * 2
+}
+
+func (state *ssdeepState) reset(blockSize uint32) {
+	h1, h2 := state.hash1[:0], state.hash2[:0]
+	*state = ssdeepState{
+		blockSize: blockSize,
+		p1:        hashInit,
+		p2:        hashInit,
+		hash1:     h1,
+		hash2:     h2,
+	}
 }
 
 // newSSDeepState initializes a new ssdeepState
 // Initialization details:
 //   - p1/p2 initialized to hashInit (initial value for piecewise hash);
-//   - res1/res2 pre-allocated to avoid frequent expansion;
+//   - hash1/hash2 pre-allocated to avoid frequent expansion;
 //   - blockSize passed from upper layer to make output digest close to target length (see estimateBlockSize).
 func newSSDeepState(blockSize uint32) *ssdeepState {
-	return &ssdeepState{
-		blockSize: blockSize,
-		p1:        hashInit,
-		p2:        hashInit,
-		res1:      make([]byte, 0, spamSumLength+1),
-		res2:      make([]byte, 0, spamSumLength+1),
-	}
+	state := ssdeepStatePool.Get().(*ssdeepState)
+	state.reset(blockSize)
+	return state
 }
 
 // Write processes the input byte stream and updates the hash state.
 // It maintains both rolling hash (for determining chunk boundaries) and piecewise hash (for calculating block content digests).
-func (s *ssdeepState) Write(p []byte) (n int, err error) {
-	bs1 := s.blockSize
+func (state *ssdeepState) Write(p []byte) (n int, err error) {
+	bs1 := state.blockSize
 	bs2 := bs1 * 2
-	h1, h2, h3 := s.h1, s.h2, s.h3
-	p1, p2 := s.p1, s.p2
-	n_idx := s.n
+	h1, h2, h3 := state.h1, state.h2, state.h3
+	p1, p2 := state.p1, state.p2
+	n_idx := state.n
+	winIdx := n_idx % windowSize
 
 	for _, c := range p {
 		u_c := uint32(c)
@@ -110,9 +130,13 @@ func (s *ssdeepState) Write(p []byte) (n int, err error) {
 		h2 += windowSize * u_c
 
 		h1 += u_c
-		h1 -= uint32(s.window[n_idx%windowSize])
+		h1 -= uint32(state.window[winIdx])
 
-		s.window[n_idx%windowSize] = c
+		state.window[winIdx] = c
+		winIdx++
+		if winIdx == windowSize {
+			winIdx = 0
+		}
 		n_idx++
 
 		h3 <<= 5
@@ -127,28 +151,49 @@ func (s *ssdeepState) Write(p []byte) (n int, err error) {
 		h := h1 + h2 + h3
 
 		// Check if first chunk boundary reached (blockSize)
+		// Optimization: h % bs2 == bs2-1 implies h % bs1 == bs1-1 because bs2 = bs1 * 2
 		if h%bs1 == (bs1 - 1) {
-			if len(s.res1) < spamSumLength {
-				s.res1 = append(s.res1, base64Chars[p1%64])
+			if len(state.hash1) < spamSumLength {
+				state.hash1 = append(state.hash1, base64Chars[p1%64])
 			}
 			p1 = hashInit // Reset piecewise hash to process next chunk
-		}
 
-		// Check if second chunk boundary reached (blockSize * 2)
-		if h%bs2 == (bs2 - 1) {
-			if len(s.res2) < spamSumLength {
-				s.res2 = append(s.res2, base64Chars[p2%64])
+			// Check if second chunk boundary reached (blockSize * 2)
+			if h%bs2 == (bs2 - 1) {
+				if len(state.hash2) < spamSumLength {
+					state.hash2 = append(state.hash2, base64Chars[p2%64])
+				}
+				p2 = hashInit
 			}
-			p2 = hashInit
 		}
 	}
 
-	// 将局部变量写回结构体状态
-	s.h1, s.h2, s.h3 = h1, h2, h3
-	s.p1, s.p2 = p1, p2
-	s.n = n_idx
+	// Write local variables back to state struct
+	state.h1, state.h2, state.h3 = h1, h2, h3
+	state.p1, state.p2 = p1, p2
+	state.n = n_idx
 
 	return len(p), nil
+}
+
+// Sum returns the final generated ssdeep hash string in format "blockSize:hash1:hash2"
+func (state *ssdeepState) Sum() string {
+	// Process remaining data even if no boundary was reached
+	r1 := state.hash1
+	if state.p1 != hashInit && len(r1) < spamSumLength {
+		r1 = append(r1, base64Chars[state.p1%64])
+	}
+	r2 := state.hash2
+	if state.p2 != hashInit && len(r2) < spamSumLength {
+		r2 = append(r2, base64Chars[state.p2%64])
+	}
+
+	return fmt.Sprintf("%d:%s:%s", state.blockSize, string(r1), string(r2))
+}
+
+func (state *ssdeepState) Close() error {
+	ssdeepStatePool.Put(state)
+	return nil
 }
 
 // Compare calculates similarity score (0 to 100) between two ssdeep hash values.
@@ -160,9 +205,19 @@ func Compare(hash1, hash2 string) (int, error) {
 		return 0, fmt.Errorf("invalid hash format")
 	}
 
-	var b1, b2 uint32
-	fmt.Sscanf(p1[0], "%d", &b1)
-	fmt.Sscanf(p2[0], "%d", &b2)
+	var (
+		b1, b2 int
+		err    error
+	)
+
+	if b1, err = strconv.Atoi(p1[0]); err != nil {
+		return 0, err
+	}
+
+	if b2, err = strconv.Atoi(p2[0]); err != nil {
+		return 0, err
+	}
+
 	s1_1, s1_2 := p1[1], p1[2]
 	s2_1, s2_2 := p2[1], p2[2]
 
@@ -171,19 +226,20 @@ func Compare(hash1, hash2 string) (int, error) {
 		return 0, nil
 	}
 
-	if b1 == b2 {
-		// 比较相同块大小的部分
+	switch b1 {
+	case b2:
+		// compare equal block size parts
 		score1 := score(s1_1, s2_1)
 		score2 := score(s1_2, s2_2)
 		if score1 > score2 {
 			return score1, nil
 		}
 		return score2, nil
-	} else if b1 == b2*2 {
-		// 比较 hash1 的第一部分和 hash2 的第二部分
+	case b2 * 2:
+		// compare hash1 first part and hash2 second part
 		return score(s1_1, s2_2), nil
-	} else {
-		// 比较 hash1 的第二部分和 hash2 的第一部分
+	default:
+		// compare hash1 second part and hash2 first part
 		return score(s1_2, s2_1), nil
 	}
 }
@@ -197,27 +253,28 @@ func score(s1, s2 string) int {
 		return 100
 	}
 
-	// 预处理：压缩连续超过 3 个的相同字符（ssdeep 规范）
-	s1 = shrink(s1)
-	s2 = shrink(s2)
+	// Use stack-allocated buffers for shrinking to avoid allocations
+	var b1Buf, b2Buf [64]byte
+	b1 := shrink(s1, b1Buf[:0])
+	b2 := shrink(s2, b2Buf[:0])
 
-	n1 := len(s1)
-	n2 := len(s2)
+	n1 := len(b1)
+	n2 := len(b2)
 	if n1 == 0 || n2 == 0 {
 		return 0
 	}
 
 	matches := 0
 	for {
-		l, ia, ib := findLongestCommonSubstring(s1, s2, 3)
+		l, ia, ib := findLongestCommonBytes(b1, b2, 3)
 		if l < 3 {
 			break
 		}
 		matches += l
-		// 从两个字符串中移除已匹配的子串以避免重复计数
-		s1 = s1[:ia] + s1[ia+l:]
-		s2 = s2[:ib] + s2[ib+l:]
-		if len(s1) < 3 || len(s2) < 3 {
+		// Remove matched substring in-place from the buffers
+		b1 = append(b1[:ia], b1[ia+l:]...)
+		b2 = append(b2[:ib], b2[ib+l:]...)
+		if len(b1) < 3 || len(b2) < 3 {
 			break
 		}
 	}
@@ -226,66 +283,57 @@ func score(s1, s2 string) int {
 		return 0
 	}
 
-	// 使用官方公式：score = round(200 * matches / (len1 + len2))，并限制在 0..100
-	scoreF := int(float64(matches*200)/float64(n1+n2) + 0.5)
-	if scoreF > 100 {
-		scoreF = 100
-	}
+	// Use official formula: score = round(200 * matches / (len1 + len2))
+	scoreF := min(int(float64(matches*200)/float64(n1+n2)+0.5), 100)
 	return scoreF
 }
 
 // shrink compresses characters that repeat consecutively more than 3 times, which is part of ssdeep similarity algorithm
-func shrink(s string) string {
-	if len(s) <= 3 {
-		return s
-	}
-	res := make([]byte, 0, len(s))
-	for i := 0; i < len(s); i++ {
-		// Skip if current character is the same as the previous three characters
-		if i < 3 || s[i] != s[i-1] || s[i] != s[i-2] || s[i] != s[i-3] {
-			res = append(res, s[i])
+func shrink(s string, buf []byte) []byte {
+	n := len(s)
+	for i := range n {
+		c := s[i]
+		if i < 3 || c != s[i-1] || c != s[i-2] || c != s[i-3] {
+			buf = append(buf, c)
 		}
 	}
-	return string(res)
+
+	return buf
 }
 
-// findLongestCommonSubstring finds the longest common substring in a, b with length at least minLen,
-// returns (length, position in a, position in b).
-// This function is used in the similarity calculation algorithm to find matching patterns between two hash strings.
-func findLongestCommonSubstring(a, b string, minLen int) (int, int, int) {
-	na := len(a)
-	nb := len(b)
-	maxL := na
-	if nb < maxL {
-		maxL = nb
+// findLongestCommonBytes finds the longest common substring in byte slices
+// This function is used in the similarity calculation algorithm to find matching patterns between two hash byte slices.
+func findLongestCommonBytes(a, b []byte, minLen int) (int, int, int) {
+	na, nb := len(a), len(b)
+	if na < minLen || nb < minLen {
+		return 0, 0, 0
 	}
-	for L := maxL; L >= minLen; L-- {
-		seen := make(map[string]int)
-		for i := 0; i+L <= na; i++ {
-			seen[a[i:i+L]] = i
-		}
-		for j := 0; j+L <= nb; j++ {
-			if ia, ok := seen[b[j:j+L]]; ok {
-				return L, ia, j
+
+	// Use uint8 DP table on stack since strings are short (max 64)
+	// This fits well in L1 cache (4KB)
+	var dp [65][65]uint8
+	bestLen := 0
+	bestIa, bestIb := 0, 0
+
+	for i := 1; i <= na; i++ {
+		for j := 1; j <= nb; j++ {
+			if a[i-1] == b[j-1] {
+				l := dp[i-1][j-1] + 1
+				dp[i][j] = l
+				if int(l) > bestLen {
+					bestLen = int(l)
+					bestIa = i - bestLen
+					bestIb = j - bestLen
+				}
 			}
+			// dp[i][j] is already 0 by default, so no need for else
 		}
+	}
+
+	if bestLen >= minLen {
+		return bestLen, bestIa, bestIb
 	}
 	return 0, 0, 0
-}
-
-// Sum returns the final generated ssdeep hash string in format "blockSize:hash1:hash2"
-func (s *ssdeepState) Sum() string {
-	// Process remaining data even if no boundary was reached
-	r1 := s.res1
-	if s.p1 != hashInit && len(r1) < spamSumLength {
-		r1 = append(r1, base64Chars[s.p1%64])
-	}
-	r2 := s.res2
-	if s.p2 != hashInit && len(r2) < spamSumLength {
-		r2 = append(r2, base64Chars[s.p2%64])
-	}
-
-	return fmt.Sprintf("%d:%s:%s", s.blockSize, string(r1), string(r2))
 }
 
 // sumWithFixedSize processes data stream with a fixed size, using the correct block size
