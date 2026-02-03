@@ -5,12 +5,16 @@ package ssdeep
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -24,6 +28,9 @@ const (
 	base64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 	// hashInit is the initial value for piecewise hash (compatible with official implementation)
 	hashInit = 0x01234567
+
+	defaultCachedSize = 4 << 20
+	minCachedSize     = 128 << 10
 )
 
 var (
@@ -31,7 +38,9 @@ var (
 )
 
 type hashOptions struct {
-	size int64
+	size       int64
+	cachedSize int64
+	cleanup    bool
 }
 
 type Option interface {
@@ -49,6 +58,30 @@ func (o sizeOption) apply(h *hashOptions) {
 // WithFixedSize option allows specifying a fixed size for the hash.
 func WithFixedSize(size int64) Option {
 	return sizeOption(size)
+}
+
+type cachedSizeOption int64
+
+func (o cachedSizeOption) apply(h *hashOptions) {
+	if o > minBlockSize {
+		h.cachedSize = int64(o)
+	}
+}
+
+// WithCachedSize option allows specifying a cached size for the hash.
+func WithCachedSize(size int64) Option {
+	return cachedSizeOption(size)
+}
+
+type cleanupOption bool
+
+func (o cleanupOption) apply(h *hashOptions) {
+	h.cleanup = bool(o)
+}
+
+// WithCleanup option enables cleanup of temporary resources cached by kernel.
+func WithCleanup() Option {
+	return cleanupOption(true)
 }
 
 var ssdeepStatePool = sync.Pool{
@@ -345,41 +378,6 @@ func shrink(s string, buf []byte) []byte {
 	return buf
 }
 
-// findLongestCommonBytes finds the longest common substring in byte slices
-// This function is used in the similarity calculation algorithm to find matching patterns between two hash byte slices.
-func findLongestCommonBytes(a, b []byte, minLen int) (int, int, int) {
-	na, nb := len(a), len(b)
-	if na < minLen || nb < minLen {
-		return 0, 0, 0
-	}
-
-	// Use uint8 DP table on stack since strings are short (max 64)
-	// This fits well in L1 cache (4KB)
-	var dp [65][65]uint8
-	bestLen := 0
-	bestIa, bestIb := 0, 0
-
-	for i := 1; i <= na; i++ {
-		for j := 1; j <= nb; j++ {
-			if a[i-1] == b[j-1] {
-				l := dp[i-1][j-1] + 1
-				dp[i][j] = l
-				if int(l) > bestLen {
-					bestLen = int(l)
-					bestIa = i - bestLen
-					bestIb = j - bestLen
-				}
-			}
-			// dp[i][j] is already 0 by default, so no need for else
-		}
-	}
-
-	if bestLen >= minLen {
-		return bestLen, bestIa, bestIb
-	}
-	return 0, 0, 0
-}
-
 // sumWithFixedSize processes data stream with a fixed size, using the correct block size
 func sumWithFixedSize(r io.Reader, fixedSize int64) (string, error) {
 	if fixedSize <= 0 {
@@ -398,13 +396,6 @@ func sumWithFixedSize(r io.Reader, fixedSize int64) (string, error) {
 
 // Bytes computes the ssdeep fuzzy hash for a given byte slice.
 func Bytes(data []byte) (string, error) {
-	if len(data) == 0 {
-		// Return a default empty hash representation instead of error
-		// Following the original ssdeep convention for empty data
-		blockSize := estimateBlockSize(0)
-		return fmt.Sprintf("%d::", blockSize), nil
-	}
-
 	return sumWithFixedSize(bytes.NewReader(data), int64(len(data)))
 }
 
@@ -428,7 +419,7 @@ type statReader interface {
 // For objects implementing io.ReadSeeker (like files), it pre-fetches the size for optimal block size.
 // For regular Readers, it tries to determine the size when possible, or estimates block size from initial data.
 func Stream(r io.Reader, options ...Option) (string, error) {
-	var opts = hashOptions{size: -1}
+	var opts = hashOptions{size: -1, cachedSize: defaultCachedSize}
 	for _, o := range options {
 		o.apply(&opts)
 	}
@@ -459,65 +450,27 @@ func Stream(r io.Reader, options ...Option) (string, error) {
 		return sumWithFixedSize(r, opts.size)
 	}
 
-	// 对于普通Reader，我们需要估算合适的块大小
-	// 因为我们无法预先知道总大小（并且不能重置流）
-	//
-	// 解决方案：使用分块读取的方式，在读取过程中估算大小
-	const chunkSize = 64 * 1024 // 64KB chunks
-	buffer := make([]byte, chunkSize)
+	// For non-seekable readers, cache the data to determine the correct block size
+	sr := newStreamReader(r, opts.cachedSize, opts.cleanup)
+	defer sr.Close()
 
-	// 读取第一块数据来估算大小
-	n, err := r.Read(buffer)
-	if err == io.EOF {
-		// 数据很少，直接处理
-		blockSize := estimateBlockSize(int64(n))
-		state := newSSDeepState(blockSize)
-		_, writeErr := state.Write(buffer[:n])
-		if writeErr != nil {
-			return "", writeErr
-		}
-		return state.Sum(), nil
-	}
-	if err != nil && err != io.EOF {
+	// Read all data to determine total size
+	if err := sr.ReadAll(); err != nil {
 		return "", err
 	}
 
-	// 基于已读取的数据估算总大小
-	// 如果第一块是满的，我们假设还有更多数据
-	var estimatedTotalSize int64
-	if n == chunkSize {
-		// 如果第一块是满的，假设实际大小是当前的2-4倍（启发式方法）
-		estimatedTotalSize = int64(n) * 4
-	} else {
-		// 如果第一块不满，这就是全部数据
-		estimatedTotalSize = int64(n)
-	}
-
-	// 使用估算的大小创建状态
-	blockSize := estimateBlockSize(estimatedTotalSize)
+	// Calculate block size based on actual size
+	blockSize := estimateBlockSize(sr.Size())
 	state := newSSDeepState(blockSize)
 
-	// 处理第一块数据
-	_, writeErr := state.Write(buffer[:n])
-	if writeErr != nil {
-		return "", writeErr
+	// Reset and read from cached data
+	if err := sr.Reset(); err != nil {
+		return "", err
 	}
 
-	// 继续处理剩余数据
-	for {
-		n, err := r.Read(buffer)
-		if n > 0 {
-			_, writeErr := state.Write(buffer[:n])
-			if writeErr != nil {
-				return "", writeErr
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return "", err
-		}
+	// Hash the cached data
+	if _, err := io.Copy(state, sr); err != nil {
+		return "", err
 	}
 
 	return state.Sum(), nil
@@ -533,4 +486,143 @@ func estimateBlockSize(size int64) uint32 {
 		blockSize *= 2
 	}
 	return blockSize
+}
+
+// streamReader caches stream data in memory (if small) or temporary file (if large)
+// to enable accurate block size calculation for non-seekable streams
+type streamReader struct {
+	r          io.Reader
+	cached     []byte   // In-memory cache for small streams
+	file       *os.File // Temporary file for large streams
+	cachedSize int64    // Maximum size to cache in memory
+	size       int64    // Total size of cached data
+	offset     int64    // Current read position
+	cleanup    bool     // Whether to cleanup temporary resources
+}
+
+// newStreamReader creates a new stream reader with the specified cache size
+func newStreamReader(r io.Reader, cachedSize int64, cleanup bool) *streamReader {
+	if cachedSize < minCachedSize {
+		cachedSize = minCachedSize
+	}
+
+	return &streamReader{
+		r:          r,
+		cachedSize: cachedSize,
+		cleanup:    cleanup,
+	}
+}
+
+// ReadAll reads all data from the source stream into cache (memory or file)
+func (sr *streamReader) ReadAll() error {
+	// Start with memory buffer
+	sr.cached = make([]byte, 0, minCachedSize)
+	buf := make([]byte, 32*1024) // 32KB read buffer
+
+	for {
+		n, err := sr.r.Read(buf)
+		if n > 0 {
+			sr.size += int64(n)
+
+			// Check if we need to switch to file storage
+			if sr.file == nil && sr.size > sr.cachedSize {
+				if err := sr.switchToFile(); err != nil {
+					return err
+				}
+			}
+
+			if sr.file != nil {
+				// Write to temporary file
+				if _, writeErr := sr.file.Write(buf[:n]); writeErr != nil {
+					return writeErr
+				}
+			} else {
+				// Append to memory cache
+				sr.cached = append(sr.cached, buf[:n]...)
+			}
+		}
+
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+// switchToFile migrates cached memory data to a temporary file
+func (sr *streamReader) switchToFile() error {
+	file, err := os.CreateTemp("", "ssdeep-*")
+	if err != nil {
+		return err
+	}
+	sr.file = file
+
+	// Write existing cached data to file
+	if len(sr.cached) > 0 {
+		if _, err := sr.file.Write(sr.cached); err != nil {
+			sr.file.Close()
+			os.Remove(sr.file.Name())
+			return err
+		}
+		// Clear memory cache to free memory
+		sr.cached = nil
+	}
+
+	return nil
+}
+
+// Reset resets the read position to the beginning
+func (sr *streamReader) Reset() error {
+	sr.offset = 0
+	if sr.file != nil {
+		_, err := sr.file.Seek(0, io.SeekStart)
+		return err
+	}
+	return nil
+}
+
+// Read implements io.Reader interface
+func (sr *streamReader) Read(p []byte) (n int, err error) {
+	if sr.file != nil {
+		n, err = sr.file.Read(p)
+		sr.offset += int64(n)
+		return n, err
+	}
+
+	// Read from memory cache
+	if sr.offset >= int64(len(sr.cached)) {
+		return 0, io.EOF
+	}
+
+	n = copy(p, sr.cached[sr.offset:])
+	sr.offset += int64(n)
+	return n, nil
+}
+
+// Size returns the total size of cached data
+func (sr *streamReader) Size() int64 {
+	return sr.size
+}
+
+// Close cleans up resources (removes temporary file if created)
+func (sr *streamReader) Close() error {
+	if sr.file != nil {
+		if sr.cleanup {
+			fd := int(sr.file.Fd())
+			// sync unwritten dirty pages
+			syscall.Fdatasync(fd)
+
+			// clear page cache
+			unix.Fadvise(fd, 0, 0, unix.FADV_DONTNEED)
+		}
+
+		name := sr.file.Name()
+		sr.file.Close()
+		os.Remove(name)
+	}
+
+	sr.cached = nil
+	return nil
 }
