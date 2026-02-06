@@ -2,6 +2,7 @@
 
 [![Go Version](https://img.shields.io/badge/Go-1.25.6-blue.svg)](https://golang.org)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
+[![Go Reference](https://pkg.go.dev/badge/github.com/cosmorse/ssdeep.svg)](https://pkg.go.dev/github.com/cosmorse/ssdeep)
 
 [中文文档](README_zh.md)
 
